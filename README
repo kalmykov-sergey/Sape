@@ -1,1 +1,2 @@
-Sape.ru xml-rpc interface
+It is a perl library for Sape.ru xml-rpc interface usage.
+see http://api.sape.ru:80/xmlrpc/?v=extended for more info.
