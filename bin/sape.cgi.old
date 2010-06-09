@@ -1,0 +1,291 @@
+#!/usr/bin/perl -w
+use lib '/home/sergey/lib';
+use strict;
+use warnings;
+
+#use BackLinks::Sape;
+
+use CGI qw(:standard);
+use CGI::Carp qw(fatalsToBrowser);
+
+use HTTP::Cookies;
+use Data::Dumper;
+use Encode;
+use Digest::MD5 qw(md5_hex);
+require RPC::XML;
+require RPC::XML::Client;
+
+# our dear client and its default cookie_jar
+# we have no cookie file as it's useless to save cookies between sessions:
+# all valuable cookies have discard attribute
+our $cli = RPC::XML::Client->new(
+  'http://api.sape.ru:80/xmlrpc/?v=extended'
+#   'http://api.sape.ru:80/xmlrpc/'
+);
+$cli->useragent->cookie_jar(HTTP::Cookies->new);
+our $projects = {};
+
+sub call {
+    my $request = RPC::XML::request->new(@_);
+    my $resp = $cli->send_request($request);
+}
+
+sub get_projects {
+    my $resp = call('sape.get_projects');
+    return {} if ($resp->is_fault);
+    foreach(@$resp){
+        $projects->{$_->{name}->value} = $_->{id}->value;
+    }
+    return $projects;
+}
+
+sub get_links {
+    my $project = shift;
+    my $filter = shift;
+    get_projects() unless(%$projects);
+    unless ($project =~ /^\d+$/) {
+      $project = $projects->{$project}
+    }
+    my $resp = call('sape.get_project_links', RPC::XML::int->new($project));
+    my @links = 
+        map{$_->{site_url}->value.$_->{page_uri}->value}
+        grep{not defined $filter or $_->{status}->value eq $filter}
+        @$resp;
+    return \@links;
+} # filter may be 'WAIT_SEO', 'OK', 'ERROR', 'SLEEP' or 'WAIT_WM'
+
+
+sub get_links_id {
+    my $project = shift;
+    get_projects() unless(%$projects);
+    unless ($project =~ /^\d+$/) {
+      $project = $projects->{$project}
+    }
+    my $resp = call('sape.get_project_links', RPC::XML::int->new($project));
+    my %links = map{$_->{site_url}->value.$_->{page_uri}->value => $_->{id}->value} @$resp;
+    return \%links;
+}
+
+sub accept_links {
+  my ($project, @links) = @_;
+  my $link_hash = get_links_id($project);
+  my @ids = map {$link_hash->{'http://'.$_}} map {my $v = $_; $v =~ s{^http://}{}i; $_=$v;} @links;
+  return call('sape.placements_accept_seo', RPC::XML::array->new(@ids))->value;
+}
+
+sub delete_links {
+  my ($project, @links) = @_;
+  my $link_hash = get_links_id($project);
+  my @ids = map {$link_hash->{'http://'.$_}} map {my $v = $_; $v =~ s{^http://}{}i; $_=$v;} @links;
+  return call('sape.placements_delete', RPC::XML::array->new(@ids))->value;
+}
+
+sub login {
+    my ($login, $password) = @_;
+    my $response = call(
+        'sape.login',
+        RPC::XML::string->new($login),
+        RPC::XML::string->new(md5_hex($password)),
+        RPC::XML::boolean->new('true'),
+    );
+    my $session_id = $response->value;
+    # if password is not correct or sape is not available ...
+    return 0 unless($session_id =~ /\d+/);
+    return int($session_id);
+}
+
+
+# authorization
+my ($session_id, $user, $cookie, $password, $connected, $auth_msg) 
+    = (undef,undef,undef,undef,undef,undef);
+# if we already have cookies ...
+if(my %sape = cookie('sape')){
+    $user = $sape{user};
+    $password = $sape{password};
+    $session_id = login($user, $password) if (not param('action') or param('action') ne 'Выйти');
+}
+# ... else set cookie ...
+if(param('user') and param('action') eq 'Зайти'){
+    $user = param('user');
+    $password = param('password') || $password;
+    $session_id = login($user, $password);
+    if($session_id){    # send set-cookie
+        my %hash = (user => $user, password => $password);
+        $cookie = cookie(
+            -name=>'sape',
+            -value=> \%hash,
+            -expires=>'+1d'
+        );
+    } else {
+        $auth_msg = 'неверный логин или пароль';
+    }
+}
+# ... say bye-bye after logout and delete cookies
+if(param('action') eq 'Выйти'){
+    $auth_msg = "До свидания, $user";
+    ($user, $password, $session_id) = (undef, undef, undef);
+    $cookie = cookie(
+            -name=>'sape',
+            -value=> '',
+            -expires=>'+1d',
+        );
+}
+# ... check if sape connection failed ... 
+if($session_id){
+    $projects = get_projects();
+    $connected = scalar keys %{$projects};
+    ($user, $password) = (undef, undef) unless $connected;
+    $auth_msg = 'Пожалуйста, авторизуйтесь' unless $connected;
+    $auth_msg = "Вы зашли как <b>$user</b>" if $connected;
+}
+# ... and define auth_form
+my $auth_form = start_form.
+    span({-id => 'auth_msg'}, $auth_msg). br.
+    ($user
+        ?textfield(-name => 'user', -value => $user)
+        :textfield('user')
+    ).
+    '&nbsp; логин'. br. 
+    ($password
+        ?password_field(-name => 'password', -value => $password)
+        :password_field('password')
+    ). 
+    ' пароль'. br.
+    submit(
+        -name => 'action', 
+        -value => 'Зайти', 
+        -onClick => 'javascript: 
+            var el = getElementById("auth_msg"); 
+            el.innerHTML = "ждите, соединяюсь с Sape.ru";
+            el.style.visibility = "visible";
+            el.style.color = "red";'
+    ). '&nbsp;&nbsp;&nbsp;' . 
+    submit(
+        -name => 'action', 
+        -value => 'Выйти', 
+        -style => "visibility:".($connected?'visible':'hidden')
+    ). end_form;
+
+
+
+# sape project interface
+my %project_name = reverse %{$projects};
+my @project_id = keys %project_name;
+
+my @link_statuses = qw(WAIT_SEO WAIT_WM OK ERROR SLEEP);
+my @headers = qw(Проект); push @headers, @link_statuses;
+my @table = (th(\@headers));
+my $links = {};
+foreach my $pr (@project_id){
+    my %pr_links = map{$_ => get_links($pr, $_)} @link_statuses;
+    push @table, td([ 
+        $project_name{$pr}, 
+        map{"<a href=\"sape.cgi?prid=$pr&st=$_\">".(scalar @{$pr_links{$_}}).'</a>'} @link_statuses
+    ]);
+    $links->{$pr}=\%pr_links; 
+}
+
+my @link_list = ();
+if(param('prid') and param('st')){
+    @link_list = map{td($_)} @{$links->{param('prid')}{param('st')}};
+#    die Dumper $links, Dumper @link_list;
+}
+
+
+
+# now we are ready to print the page
+print header( 
+    -type => 'text/html', 
+    -charset => 'windows-1251', 
+    -cookie => $cookie,
+);
+print table({-width => '100%'}, Tr ( 
+    td({-valign => 'top'},
+        table(
+            {-cellpadding => '10px', width => '100%'},
+            undef, 
+            $connected?Tr({},\@table):''
+        )
+    ),
+    td(
+        {-valign => 'top', width => '220px'}, 
+        # авторизационная форма
+        h2('Авторизация'), $auth_form,
+    )
+));
+print table(Tr({},\@link_list));
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+__END__
+
+sub apache_fork {
+    my ($func, $redirect) = @_;
+    defined(my $pid = fork) or die "Cannot fork: $!";
+    if($pid){
+        print redirect($redirect);
+        exit;
+    } else {
+        close STDOUT;
+        close STDIN;
+        close STDERR;
+        open(STDOUT, ">/dev/null");
+        open(STDIN, "<dev/null");
+        open(STDERR, ">>/home/sergey/html/error.log");
+        &{$func};
+    }
+} # запуск фоновой процедуры при редиректе
+
+
+sub sape_init {
+    BackLinks::Sape::login('kalmykov', 'kalmykov1A');
+
+
+my $sape_info = 'Выберите проект для проверки ссылок';
+my %sape_hash = reverse %{BackLinks::Sape::get_projects()};
+my @sape_arr = keys %sape_hash;
+if(my $sape_project_id = param('sape_project')){
+    my $engine = param('engine') || 'qip';
+    my $links = BackLinks::Sape::get_links($sape_project_id);
+    my $file_id = BackLinks::file_to_db($links, $sape_hash{$sape_project_id},
+#                user => $user || 'anonymous',
+                mime_type => 'xml from sape :)',
+                engine => $engine,
+        );
+        my $redirect = "http://mail.plarson.ru:81/cgi-bin/monitor.cgi?file=$file_id";
+        apache_fork(\&BackLinks::check_last_file, $redirect); 
+}
+
+my $sape_form = h2('Проект Sape').
+    start_multipart_form(-method => 'GET', -style => 'width:220px;').
+    submit(-name => 'Выбрать проект'). br. 
+            popup_menu(
+#                -onChange => 'submit()',
+                -name => 'sape_project',
+                -values => [@sape_arr],
+                -labels => \%sape_hash,
+                -default => '',
+            ).
+    end_form;
+
+
+print header(-type => 'text/html', -charset => 'windows-1251');
+unless($projects){ print 'Пожалуйста, авторизуйтесь', br, $auth_form; exit; }
+print $projects
+#print ;
